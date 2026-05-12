@@ -6,6 +6,7 @@ import subprocess
 import json
 from datetime import datetime
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib3
 urllib3.disable_warnings()
 
@@ -13,6 +14,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_TOKEN = os.environ["API_TOKEN"]
 GROQ_KEY  = os.environ.get("GROQ_KEY", "")
 FONT_SIZE = int(os.environ.get("FONT_SIZE", "16"))
+PORT      = int(os.environ.get("PORT", "8080"))
 
 TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 active_users = {}
@@ -31,11 +33,12 @@ def tg_send(chat_id, text, reply_to=None, thread_id=None):
 def run_pipeline(msg_chat, thread_id, msg_id, user_id, heygen_key, avatar_id, voice_id, script_text):
     try:
         session_id = int(time.time())
-        log(f"🎬 user={user_id} avatar={avatar_id[:16]} voice={voice_id[:8]}")
-        sub_note = " + субтитры" if GROQ_KEY else ""
-        tg_send(msg_chat, f"⏳ Генерирую видео{sub_note}...\n🤖 {avatar_id[:30]}\n🕐 3-10 мин.",
+        log(f"user={user_id} avatar={avatar_id[:16]} voice={voice_id[:8]}")
+        sub_note = " + subtitles" if GROQ_KEY else ""
+        tg_send(msg_chat, f"Generating video{sub_note}...\n{avatar_id[:30]}\n3-10 min.",
             reply_to=msg_id, thread_id=thread_id)
 
+        # -- HeyGen create video --
         hg_h = {"X-Api-Key": heygen_key, "Content-Type": "application/json"}
         payload = {
             "video_inputs": [{
@@ -47,20 +50,17 @@ def run_pipeline(msg_chat, thread_id, msg_id, user_id, heygen_key, avatar_id, vo
             }],
             "dimension": {"width": 720, "height": 1280}
         }
-
         r = requests.post("https://api.heygen.com/v2/video/generate",
             headers=hg_h, json=payload, timeout=60, verify=False)
         rj = r.json()
-        log(f"HeyGen HTTP {r.status_code}: {json.dumps(rj)[:150]}")
-
+        log(f"HeyGen {r.status_code}: {json.dumps(rj)[:150]}")
         if r.status_code != 200 or rj.get("error"):
-            tg_send(msg_chat, f"❌ HeyGen error: {rj}", reply_to=msg_id, thread_id=thread_id); return
-
+            tg_send(msg_chat, f"HeyGen error: {rj}", reply_to=msg_id, thread_id=thread_id); return
         video_id = (rj.get("data") or {}).get("video_id")
         if not video_id:
-            tg_send(msg_chat, "❌ No video_id from HeyGen", reply_to=msg_id, thread_id=thread_id); return
+            tg_send(msg_chat, "No video_id", reply_to=msg_id, thread_id=thread_id); return
 
-        log(f"⏳ Polling {video_id}...")
+        # -- Poll --
         start = time.time()
         video_url = None
         for _ in range(120):
@@ -69,37 +69,42 @@ def run_pipeline(msg_chat, thread_id, msg_id, user_id, heygen_key, avatar_id, vo
                 headers=hg_h, params={"video_id": video_id}, timeout=30, verify=False)
             pd = pr.json()
             status = (pd.get("data") or {}).get("status") or pd.get("status", "unknown")
-            log(f"  [{int(time.time()-start)}s] {status}")
+            log(f"[{int(time.time()-start)}s] {status}")
             if status == "completed":
                 video_url = (pd.get("data") or {}).get("video_url"); break
             elif status in ("failed", "error"):
-                tg_send(msg_chat, f"❌ HeyGen failed: {(pd.get('data') or {}).get('error','')}",
+                tg_send(msg_chat, f"HeyGen failed: {(pd.get('data') or {}).get('error','')}",
                     reply_to=msg_id, thread_id=thread_id); return
-
         if not video_url:
-            tg_send(msg_chat, "❌ Timeout HeyGen", reply_to=msg_id, thread_id=thread_id); return
+            tg_send(msg_chat, "Timeout HeyGen", reply_to=msg_id, thread_id=thread_id); return
 
-        log("⬇️ Downloading...")
-        raw_path = f"/tmp/hg_{session_id}_raw.mp4"
-        vid_bytes = requests.get(video_url, timeout=180, verify=False).content
-        Path(raw_path).write_bytes(vid_bytes)
-        size_mb = round(len(vid_bytes)/1024/1024, 1)
-        log(f"✅ {size_mb} MB")
+        tg_caption = script_text[:200].strip()
 
-        final_path = raw_path
         if GROQ_KEY:
+            # -- Download, add subtitles, send file --
+            log("Downloading for subtitles...")
+            raw_path = f"/tmp/hg_{session_id}_raw.mp4"
+            vid_bytes = requests.get(video_url, timeout=180, verify=False).content
+            Path(raw_path).write_bytes(vid_bytes)
+            size_mb = round(len(vid_bytes)/1024/1024, 1)
+            log(f"{size_mb} MB downloaded")
+
             tmp_audio = f"/tmp/hg_{session_id}.mp3"
             subprocess.run(["ffmpeg","-y","-i",raw_path,"-vn","-acodec","libmp3lame",
                 "-ar","16000","-ac","1","-ab","64k",tmp_audio], capture_output=True)
-            with open(tmp_audio,"rb") as af:
-                resp = requests.post("https://api.groq.com/openai/v1/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                    files={"file": ("a.mp3", af, "audio/mpeg")},
-                    data={"model":"whisper-large-v3-turbo","response_format":"verbose_json",
-                          "timestamp_granularities[]":"word"}, timeout=120)
-            words = resp.json().get("words",[]) if resp.status_code==200 else []
-            log(f"Transcribed: {len(words)} words")
 
+            words = []
+            if Path(tmp_audio).exists():
+                with open(tmp_audio,"rb") as af:
+                    resp = requests.post("https://api.groq.com/openai/v1/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                        files={"file": ("a.mp3", af, "audio/mpeg")},
+                        data={"model":"whisper-large-v3-turbo","response_format":"verbose_json",
+                              "timestamp_granularities[]":"word"}, timeout=120)
+                words = resp.json().get("words",[]) if resp.status_code==200 else []
+                log(f"Transcribed: {len(words)} words")
+
+            final_path = raw_path
             if words:
                 tmp_ass = f"/tmp/hg_{session_id}.ass"
                 def ts(s):
@@ -111,97 +116,104 @@ def run_pipeline(msg_chat, thread_id, msg_id, user_id, heygen_key, avatar_id, vo
                     chunks.append((c[0].get("start",0),c[-1].get("end",0),
                                    " ".join(w.get("word","").strip() for w in c)))
                     i+=4
-                font_path="/app/fonts/BrownVolky.ttf"
-                fname="Brown Volky" if Path(font_path).exists() else "Arial"
-                ass=f"""[Script Info]
-ScriptType: v4.00+
-PlayResX: 720
-PlayResY: 1280
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{fname},{FONT_SIZE},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,1,0,1,2.5,0,2,30,30,60,1
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
+                ass = f"""[Script Info]\nScriptType: v4.00+\nPlayResX: 720\nPlayResY: 1280\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,{FONT_SIZE},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,1,0,1,2.5,0,2,30,30,60,1\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"""
                 for st,en,ln in chunks:
-                    ass+=f"Dialogue: 0,{ts(st)},{ts(en)},Default,,0,0,0,,{ln.strip()}\n"
-                Path(tmp_ass).write_text(ass,encoding="utf-8")
-                final_path=f"/tmp/hg_{session_id}_final.mp4"
-                rb=subprocess.run(["ffmpeg","-y","-i",raw_path,"-vf",
-                    f"ass={tmp_ass}","-c:v","libx264","-crf","18","-preset","fast",
+                    ass += f"Dialogue: 0,{ts(st)},{ts(en)},Default,,0,0,0,,{ln.strip()}\n"
+                Path(tmp_ass).write_text(ass, encoding="utf-8")
+                final_path = f"/tmp/hg_{session_id}_final.mp4"
+                rb = subprocess.run(["ffmpeg","-y","-i",raw_path,"-vf",
+                    f"ass={tmp_ass}","-c:v","libx264","-crf","20","-preset","ultrafast",
                     "-c:a","copy",final_path], capture_output=True, text=True)
-                if rb.returncode==0:
-                    size_mb=round(Path(final_path).stat().st_size/1024/1024,1)
-                    log(f"✅ Subtitles done! {size_mb}MB")
-                    for f in [tmp_audio,tmp_ass,raw_path]:
+                if rb.returncode == 0:
+                    size_mb = round(Path(final_path).stat().st_size/1024/1024, 1)
+                    log(f"Subtitles done! {size_mb}MB")
+                    for f in [tmp_audio, tmp_ass, raw_path]:
                         try: Path(f).unlink(missing_ok=True)
                         except: pass
                 else:
-                    log(f"⚠️ ffmpeg err: {rb.stderr[-100:]}"); final_path=raw_path
+                    log(f"ffmpeg err: {rb.stderr[-100:]}"); final_path = raw_path
 
-        tg_caption = script_text[:200].strip()
-        with open(final_path,"rb") as f:
+            log("Sending with subtitles...")
+            with open(final_path,"rb") as f:
+                tr = requests.post(f"{TG}/sendVideo",
+                    data={"chat_id":msg_chat,"caption":tg_caption,"supports_streaming":"true"},
+                    files={"video":(f"v_{session_id}.mp4",f,"video/mp4")}, timeout=300)
+            td = tr.json()
+            log(f"TG ok={td.get('ok')} err={td.get('description','')}")
+            if not td.get("ok"):
+                tg_send(msg_chat, f"TG failed: {td.get('description','')}", reply_to=msg_id, thread_id=thread_id)
+            for f in [final_path]:
+                try: Path(f).unlink(missing_ok=True)
+                except: pass
+        else:
+            # -- No subtitles: send by URL directly (no download needed) --
+            log("Sending by URL (no subtitles)...")
             tr = requests.post(f"{TG}/sendVideo",
-                data={"chat_id":msg_chat,"caption":tg_caption},
-                files={"video":(f"v_{session_id}.mp4",f,"video/mp4")}, timeout=300)
-        td = tr.json()
-        log(f"TG ok={td.get('ok')} err={td.get('description','')}")
-        if not td.get("ok"):
-            tg_send(msg_chat,f"❌ TG failed: {td.get('description','')}",reply_to=msg_id,thread_id=thread_id)
-        try: Path(final_path).unlink(missing_ok=True)
-        except: pass
+                json={"chat_id": msg_chat, "video": video_url,
+                      "caption": tg_caption, "supports_streaming": True},
+                timeout=60)
+            td = tr.json()
+            log(f"TG ok={td.get('ok')} err={td.get('description','')}")
+            if not td.get("ok"):
+                tg_send(msg_chat, f"TG failed: {td.get('description','')}", reply_to=msg_id, thread_id=thread_id)
+
     except Exception as e:
         import traceback
-        log(f"❌ {e}\n{traceback.format_exc()[-300:]}")
-        tg_send(msg_chat,f"❌ {str(e)[:200]}",reply_to=msg_id,thread_id=thread_id)
+        log(f"ERROR: {e}\n{traceback.format_exc()[-300:]}")
+        tg_send(msg_chat, f"Error: {str(e)[:200]}", reply_to=msg_id, thread_id=thread_id)
     finally:
-        with lock: active_users[user_id]=False
+        with lock: active_users[user_id] = False
 
-HELP = ("👋 HeyGen Bot\n\n"
-        "Формат:\n/gen HEYGEN_KEY|AVATAR_ID|VOICE_ID\nТекст\n\n"
-        "Пример:\n/gen sk_V2_xxx|dc0778...|034ca0...\nYour text here")
 
-log(f"🚀 HeyGen Bot | subtitles={'ON' if GROQ_KEY else 'OFF'}")
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+    def log_message(self, *args): pass
+
+threading.Thread(target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(), daemon=True).start()
+
+HELP = ("HeyGen Bot\n\nFormat:\n/gen HEYGEN_KEY|AVATAR_ID|VOICE_ID\nText\n\nExample:\n/gen sk_V2_xxx|dc0778...|034ca0...\nYour text here")
+
+log(f"HeyGen Bot started | subtitles={'ON' if GROQ_KEY else 'OFF'}")
 try:
-    requests.post(f"{TG}/deleteWebhook",json={"drop_pending_updates":True},timeout=10)
-    requests.post(f"{TG}/setMyCommands",json={"commands":[
-        {"command":"gen","description":"Генерировать видео: /gen KEY|AVATAR|VOICE"},
-        {"command":"start","description":"Инструкция"}]},timeout=10)
-    log("Ready ✅")
+    requests.post(f"{TG}/deleteWebhook", json={"drop_pending_updates": True}, timeout=10)
+    requests.post(f"{TG}/setMyCommands", json={"commands": [
+        {"command": "gen", "description": "Generate video: /gen KEY|AVATAR|VOICE"},
+        {"command": "start", "description": "Instructions"}]}, timeout=10)
+    log("Ready")
 except: pass
 
-offset=0
+offset = 0
 while True:
     try:
-        r=requests.post(f"{TG}/getUpdates",
-            json={"offset":offset,"timeout":30,"limit":100,
-                  "allowed_updates":["message","channel_post"]},timeout=40)
-        if r.status_code!=200: time.sleep(5); continue
-        updates=r.json().get("result",[])
-        if updates: log(f"📨 {len(updates)} update(s)")
+        r = requests.post(f"{TG}/getUpdates",
+            json={"offset": offset, "timeout": 30, "limit": 100,
+                  "allowed_updates": ["message", "channel_post"]}, timeout=40)
+        if r.status_code != 200: time.sleep(5); continue
+        updates = r.json().get("result", [])
+        if updates: log(f"{len(updates)} update(s)")
         for upd in updates:
-            offset=upd["update_id"]+1
-            msg=upd.get("message") or upd.get("channel_post")
+            offset = upd["update_id"] + 1
+            msg = upd.get("message") or upd.get("channel_post")
             if not msg: continue
-            mc=str(msg.get("chat",{}).get("id",""))
-            mi=msg.get("message_id")
-            ti=msg.get("message_thread_id")
-            ui=str((msg.get("from") or {}).get("id","unknown"))
-            tx=(msg.get("text") or "").strip()
-            log(f"  chat={mc} user={ui} text={repr(tx[:50])}")
+            mc = str(msg.get("chat", {}).get("id", ""))
+            mi = msg.get("message_id")
+            ti = msg.get("message_thread_id")
+            ui = str((msg.get("from") or {}).get("id", "unknown"))
+            tx = (msg.get("text") or "").strip()
             if not tx: continue
-            if tx.startswith("/start"): tg_send(mc,HELP,thread_id=ti); continue
+            if tx.startswith("/start"): tg_send(mc, HELP, thread_id=ti); continue
             if tx.lower().startswith("/gen"):
-                parts=tx.split(None,1); body=parts[1].strip() if len(parts)>1 else ""
-                if not body: tg_send(mc,"❌ /gen KEY|AVATAR|VOICE\nТекст",reply_to=mi,thread_id=ti); continue
-                lines=body.split("\n",1); fl=lines[0].strip(); sc=lines[1].strip() if len(lines)>1 else ""
-                params=[p.strip() for p in fl.split("|")]
-                if len(params)!=3: tg_send(mc,"❌ Первая строка: KEY|AVATAR_ID|VOICE_ID",reply_to=mi,thread_id=ti); continue
-                hk,av,vo=params
-                if not sc: tg_send(mc,"❌ Добавь текст со второй строки",reply_to=mi,thread_id=ti); continue
+                parts = tx.split(None, 1); body = parts[1].strip() if len(parts) > 1 else ""
+                if not body: tg_send(mc, "Format: /gen KEY|AVATAR|VOICE\nText", reply_to=mi, thread_id=ti); continue
+                lines = body.split("\n", 1); fl = lines[0].strip(); sc = lines[1].strip() if len(lines) > 1 else ""
+                params = [p.strip() for p in fl.split("|")]
+                if len(params) != 3: tg_send(mc, "First line: KEY|AVATAR_ID|VOICE_ID", reply_to=mi, thread_id=ti); continue
+                hk, av, vo = params
+                if not sc: tg_send(mc, "Add text on second line", reply_to=mi, thread_id=ti); continue
                 with lock:
-                    if active_users.get(ui): tg_send(mc,"⏳ Твоё видео генерируется.",reply_to=mi,thread_id=ti); continue
-                    active_users[ui]=True
-                threading.Thread(target=run_pipeline,args=(mc,ti,mi,ui,hk,av,vo,sc),daemon=True).start()
+                    if active_users.get(ui): tg_send(mc, "Your video is generating, please wait.", reply_to=mi, thread_id=ti); continue
+                    active_users[ui] = True
+                threading.Thread(target=run_pipeline, args=(mc, ti, mi, ui, hk, av, vo, sc), daemon=True).start()
     except Exception as e:
         log(f"Poll error: {e}"); time.sleep(5)
